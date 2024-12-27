@@ -10,6 +10,8 @@ using System.Linq;
 using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Oxide.Patcher.Common;
+using Oxide.Patcher.Common.TextHighlighting;
 
 namespace Oxide.Patcher.Views
 {
@@ -35,6 +37,8 @@ namespace Oxide.Patcher.Views
 
         private bool _loaded;
 
+        private HighlightGroup _msilHighlight;
+
         public HookViewControl()
         {
             InitializeComponent();
@@ -46,7 +50,7 @@ namespace Oxide.Patcher.Views
         {
             base.OnLoad(e);
 
-            _methodDef = MainForm.GetMethod(Hook.AssemblyName, Hook.TypeName, Hook.Signature);
+            _methodDef = MainForm.AssemblyLoader.GetMethod(Hook.AssemblyName, Hook.TypeName, Hook.Signature);
 
             InitialiseDropdowns();
 
@@ -63,6 +67,8 @@ namespace Oxide.Patcher.Views
 
             flagbutton.Enabled = !Hook.Flagged;
             unflagbutton.Enabled = Hook.Flagged;
+
+            clonebutton.Enabled = Hook.ChildHook == null;
 
             LoadSettings();
 
@@ -96,11 +102,6 @@ namespace Oxide.Patcher.Views
 
             foreach (Hook hook in hooks)
             {
-                if (hook.BaseHook == Hook)
-                {
-                    clonebutton.Enabled = false;
-                }
-
                 if (hook != Hook.BaseHook && baseHooks.Contains(hook))
                 {
                     continue;
@@ -167,6 +168,7 @@ namespace Oxide.Patcher.Views
             Hook.PreparePatch(_methodDef, weaver);
 
             _msilBefore = new TextEditorControl { Dock = DockStyle.Fill, Text = weaver.ToString(), IsReadOnly = true };
+
             _codeBefore = new TextEditorControl
             {
                 Dock = DockStyle.Fill,
@@ -177,7 +179,9 @@ namespace Oxide.Patcher.Views
 
             Hook.ApplyPatch(_methodDef, weaver);
 
-            _msilAfter = new TextEditorControl { Dock = DockStyle.Fill, Text = weaver.ToString(), IsReadOnly = true };
+            string afterText = weaver.ToString();
+
+            _msilAfter = new TextEditorControl { Dock = DockStyle.Fill, Text = afterText, IsReadOnly = true };
             _codeAfter = new TextEditorControl
             {
                 Dock = DockStyle.Fill,
@@ -190,6 +194,35 @@ namespace Oxide.Patcher.Views
             aftertab.Controls.Add(_msilAfter);
             codebeforetab.Controls.Add(_codeBefore);
             codeaftertab.Controls.Add(_codeAfter);
+
+            _msilHighlight = new HighlightGroup(_msilAfter);
+
+            AddHighlight(afterText);
+        }
+
+        private void AddHighlight(string afterText)
+        {
+            int searchIndex = afterText.IndexOf($"\"{Hook.HookName}\"");
+            if (searchIndex == -1)
+            {
+                return;
+            }
+
+            int startIndex = afterText.LastIndexOf("IL_", searchIndex);
+            if (startIndex == -1)
+            {
+                return;
+            }
+
+            int endIndex = afterText.IndexOf("\n", startIndex);
+            if (endIndex == -1)
+            {
+                return;
+            }
+
+            TextMarker marker = new TextMarker(startIndex, endIndex - startIndex, TextMarkerType.SolidBlock, Color.Yellow, Color.Black);
+
+            _msilHighlight.AddMarker(marker);
         }
 
         #endregion
@@ -213,7 +246,7 @@ namespace Oxide.Patcher.Views
         private void flagbutton_Click(object sender, EventArgs e)
         {
             Hook.Flagged = true;
-            MainForm.UpdateHook(Hook, false);
+            MainForm.UpdateHook(Hook);
             flagbutton.Enabled = false;
             unflagbutton.Enabled = true;
         }
@@ -221,7 +254,7 @@ namespace Oxide.Patcher.Views
         private void unflagbutton_Click(object sender, EventArgs e)
         {
             Hook.Flagged = false;
-            MainForm.UpdateHook(Hook, false);
+            MainForm.UpdateHook(Hook);
             if (Hook.Flagged)
             {
                 return;
@@ -286,11 +319,16 @@ namespace Oxide.Patcher.Views
 
         private async void applybutton_Click(object sender, EventArgs e)
         {
+            string oldName = Hook.Name;
+
             Hook.Name = nametextbox.Text;
             Hook.HookName = hooknametextbox.Text;
-            Hook.HookDescription = hookdescriptiontextbox.Text;
+            if (hookdescriptiontextbox.Text != string.Empty)
+            {
+                Hook.HookDescription = hookdescriptiontextbox.Text;
+            }
 
-            MainForm.UpdateHook(Hook, false);
+            MainForm.UpdateHook(Hook, oldName: oldName != nametextbox.Text ? oldName : null);
 
             if (_msilBefore != null && _msilAfter != null)
             {
@@ -301,8 +339,13 @@ namespace Oxide.Patcher.Views
                 _codeBefore.Text = await Decompiler.GetSourceCode(_methodDef, weaver);
 
                 Hook.ApplyPatch(_methodDef, weaver);
-                _msilAfter.Text = weaver.ToString();
+
+                string afterText = weaver.ToString();
+
+                _msilAfter.Text = afterText;
                 _codeAfter.Text = await Decompiler.GetSourceCode(_methodDef, weaver);
+
+                AddHighlight(afterText);
             }
 
             applybutton.Enabled = false;
@@ -342,6 +385,13 @@ namespace Oxide.Patcher.Views
 
         private void clonebutton_Click(object sender, EventArgs e)
         {
+            if (Hook.ChildHook != null)
+            {
+                MessageBox.Show($"You can only clone a hook once, use the last clone in the method ({GetLastCloneName(Hook)}) to create another clone",
+                                "Cannot clone", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
             Hook newHook = Activator.CreateInstance(Hook.GetType()) as Hook;
             newHook.Name = Hook.Name + "(Clone)";
             newHook.HookName = Hook.HookName + "(Clone)";
@@ -353,10 +403,24 @@ namespace Oxide.Patcher.Views
             newHook.MSILHash = Hook.MSILHash;
             newHook.BaseHook = Hook;
 
+            Hook.ChildHook = newHook;
+
             MainForm.AddHook(newHook);
             MainForm.GotoHook(newHook);
 
             clonebutton.Enabled = false;
+        }
+
+        private string GetLastCloneName(Hook hook)
+        {
+            Hook currentHook = hook;
+
+            while (currentHook.ChildHook != null)
+            {
+                currentHook = currentHook.ChildHook;
+            }
+
+            return currentHook.Name;
         }
 
         #endregion

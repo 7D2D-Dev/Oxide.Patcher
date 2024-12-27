@@ -10,7 +10,7 @@ using ICSharpCode.NRefactory.CSharp;
 
 using Mono.Cecil;
 using Mono.Cecil.Cil;
-
+using Oxide.Patcher.Common;
 using Oxide.Patcher.Hooks;
 
 namespace Oxide.Patcher.Docs
@@ -28,7 +28,7 @@ namespace Oxide.Patcher.Docs
         public DocsMethodData MethodData { get; set; }
         public string CodeAfterInjection { get; set; }
 
-        private string _targetDirectory;
+        private readonly string _targetDirectory;
 
         public DocsHook(Hook hook, MethodDefinition methodDef, string targetDirectory)
         {
@@ -65,13 +65,15 @@ namespace Oxide.Patcher.Docs
 
             string methodSourceCode = GetSourceCode(methodDef);
 
+            methodDef.Body = null;
+
             string[] lines = Regex.Split(methodSourceCode, "\r\n|\r|\n");
 
             for (int i = 0; i < lines.Length; i++)
             {
                 string line = lines[i];
 
-                if (!line.Contains("Interface.CallHook"))
+                if (!line.Contains($"Interface.CallHook(\"{hook.HookName}\""))
                 {
                     continue;
                 }
@@ -83,7 +85,7 @@ namespace Oxide.Patcher.Docs
 
                 if (startIndex > 0)
                 {
-                    sb.AppendLine("...");
+                    sb.AppendLine("//---");
                 }
 
                 for (int x = startIndex; x < endIndex && x < lines.Length; x++)
@@ -93,7 +95,7 @@ namespace Oxide.Patcher.Docs
 
                 if (endIndex < lines.Length - 1)
                 {
-                    sb.AppendLine("...");
+                    sb.AppendLine("//---");
                 }
 
                 CodeAfterInjection = sb.ToString();
@@ -449,7 +451,7 @@ namespace Oxide.Patcher.Docs
 
         private void AddThisArg(Hook hook, Dictionary<string, string> dict)
         {
-            TypeDefinition type = PatcherForm.MainForm.GetType(hook.AssemblyName, hook.TypeName);
+            TypeDefinition type = DocsGenerator.AssemblyLoader.GetType(hook.AssemblyName, hook.TypeName);
             if (type == null)
             {
                 return;

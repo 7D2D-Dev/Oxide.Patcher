@@ -1,4 +1,4 @@
-﻿using Newtonsoft.Json;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -75,12 +75,23 @@ namespace Oxide.Patcher
                             continue;
                         }
 
-                        hook.BaseHook = manifest.Hooks.Find(x => x.Name == hook.BaseHookName);
-
-                        if (hook.BaseHook == null)
+                        Hook baseHook = manifest.Hooks.Find(x => x.Name == hook.BaseHookName);
+                        if (baseHook == null)
                         {
-                            MessageBox.Show($"Could not find base hook '{hook.BaseHookName}' for hook '{hook.Name}'", "Base hook missing!",
-                                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            if (PatcherForm.MainForm != null)
+                            {
+                                MessageBox.Show($"Could not find base hook '{hook.BaseHookName}' for hook '{hook.Name}'", "Base hook missing!",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                            }
+                            else
+                            {
+                                Console.WriteLine($"ERROR: Could not find base hook '{hook.BaseHookName}' for hook '{hook.Name}'");
+                            }
+                        }
+                        else
+                        {
+                            hook.BaseHook = baseHook;
+                            baseHook.ChildHook = hook;
                         }
                     }
                 }

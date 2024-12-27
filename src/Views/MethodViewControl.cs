@@ -6,6 +6,7 @@ using Oxide.Patcher.Modifiers;
 using Oxide.Patcher.Patching;
 using System;
 using System.Windows.Forms;
+using Oxide.Patcher.Common;
 
 namespace Oxide.Patcher
 {
@@ -125,7 +126,7 @@ namespace Oxide.Patcher
             hook.Name = MethodDef.Name;
             hook.HookName = hook.Name.StartsWith("On") ? hook.Name : $"On{hook.Name}";
             hook.TypeName = MethodDef.DeclaringType.FullName;
-            hook.AssemblyName = MainForm.rassemblydict[MethodDef.Module.Assembly];
+            hook.AssemblyName = MainForm.AssemblyLoader.rassemblydict[MethodDef.Module.Assembly];
             hook.Signature = Utility.GetMethodSignature(MethodDef);
             hook.MSILHash = new ILWeaver(MethodDef.Body).Hash;
 
@@ -145,7 +146,7 @@ namespace Oxide.Patcher
 
         private void editbutton_Click(object sender, EventArgs e)
         {
-            Modifier modifier = new Modifier(MethodDef, MainForm.rassemblydict[MethodDef.Module.Assembly]);
+            Modifier modifier = new Modifier(MethodDef, MainForm.AssemblyLoader.rassemblydict[MethodDef.Module.Assembly]);
 
             MainForm.AddModifier(modifier);
             MainForm.GotoModifier(modifier);

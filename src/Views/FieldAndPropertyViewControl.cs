@@ -4,6 +4,7 @@ using System;
 using System.Text;
 using System.Windows.Forms;
 using Mono.CSharp;
+using Oxide.Patcher.Common;
 
 namespace Oxide.Patcher
 {
@@ -110,8 +111,8 @@ namespace Oxide.Patcher
         private void editbutton_Click(object sender, EventArgs e)
         {
             Modifier modifier = FieldDef != null
-                ? new Modifier(FieldDef, MainForm.rassemblydict[FieldDef.Module.Assembly])
-                : new Modifier(PropertyDef, MainForm.rassemblydict[PropertyDef.Module.Assembly]);
+                ? new Modifier(FieldDef, MainForm.AssemblyLoader.rassemblydict[FieldDef.Module.Assembly])
+                : new Modifier(PropertyDef, MainForm.AssemblyLoader.rassemblydict[PropertyDef.Module.Assembly]);
 
             MainForm.AddModifier(modifier);
             MainForm.GotoModifier(modifier);

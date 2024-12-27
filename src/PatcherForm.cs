@@ -1,12 +1,6 @@
-using Mono.Cecil;
-using Oxide.Patcher.Deobfuscation;
-using Oxide.Patcher.Fields;
-using Oxide.Patcher.Hooks;
-using Oxide.Patcher.Modifiers;
-using Oxide.Patcher.Patching;
-using Oxide.Patcher.Views;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
@@ -14,9 +8,18 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Windows.Forms;
 using System.Threading.Tasks;
+using System.Windows.Forms;
+using Mono.Cecil;
+using Oxide.Patcher.Common;
+using Oxide.Patcher.Common.Extensions;
+using Oxide.Patcher.Deobfuscation;
 using Oxide.Patcher.Docs;
+using Oxide.Patcher.Fields;
+using Oxide.Patcher.Hooks;
+using Oxide.Patcher.Modifiers;
+using Oxide.Patcher.Patching;
+using Oxide.Patcher.Views;
 
 namespace Oxide.Patcher
 {
@@ -27,6 +30,8 @@ namespace Oxide.Patcher
         /// </summary>
         public Project CurrentProject { get; private set; }
 
+        public AssemblyLoader AssemblyLoader { get; private set; }
+
         /// <summary>
         /// Gets the filename of the currently open project
         /// </summary>
@@ -36,11 +41,6 @@ namespace Oxide.Patcher
         /// Gets the current settings
         /// </summary>
         public UserSettings Settings { get; private set; }
-
-        private Dictionary<string, AssemblyDefinition> assemblydict;
-        internal Dictionary<AssemblyDefinition, string> rassemblydict;
-
-        private IAssemblyResolver resolver;
 
         private Version version = Assembly.GetExecutingAssembly().GetName().Version;
 
@@ -60,7 +60,9 @@ namespace Oxide.Patcher
 
         private DateTime lastDragDestinationTime;
 
-        private int addedNodes = 0;
+        private Task _docsWorker;
+
+        private int addedNodes;
 
         private class NodeAssemblyData
         {
@@ -107,9 +109,6 @@ namespace Oxide.Patcher
             Size = Settings.FormSize;
             WindowState = Settings.WindowState;
 
-            assemblydict = new Dictionary<string, AssemblyDefinition>();
-            rassemblydict = new Dictionary<AssemblyDefinition, string>();
-
             if ((string.IsNullOrEmpty(CurrentProjectFilename) || !File.Exists(CurrentProjectFilename)) &&
                 (string.IsNullOrEmpty(Settings.LastProjectDirectory) || !File.Exists(Settings.LastProjectDirectory)))
             {
@@ -122,8 +121,8 @@ namespace Oxide.Patcher
 
                 DialogResult result = (DialogResult)Invoke(new ConfirmAction(() =>
                 {
-                    return MessageBox.Show("Do you want to load the last loaded project?", "Load last project?", MessageBoxButtons.YesNo,
-                                           MessageBoxIcon.Question);
+                    return MessageBox.Show($"Do you want to load the last loaded project?\n\"{Settings.LastProjectDirectory}\"",
+                                           "Load last project?", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
                 }));
 
                 if (result == DialogResult.No)
@@ -265,7 +264,14 @@ namespace Oxide.Patcher
 
             try
             {
-                DocsGenerator.GenerateFile(CurrentProject);
+                if (_docsWorker?.IsCompleted == false)
+                {
+                    MessageBox.Show("Docs data file is already being generated, please wait.", "Oxide Patcher",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                _docsWorker = Task.Run(() => DocsGenerator.GenerateFile(CurrentProject, AssemblyLoader));
             }
             catch (Exception ex)
             {
@@ -316,6 +322,10 @@ namespace Oxide.Patcher
                     else if (str == "Hooks")
                     {
                         hookmenu.Show(objectview, e.X, e.Y);
+                    }
+                    else if (str == "Modifiers")
+                    {
+                        modifiersMenu.Show(objectview, e.X, e.Y);
                     }
                     else if (str == "Category")
                     {
@@ -394,7 +404,7 @@ namespace Oxide.Patcher
                 CurrentProject.Save(CurrentProjectFilename);
                 data.Included = true;
                 data.Loaded = true;
-                data.Definition = LoadAssembly(data.AssemblyName);
+                data.Definition = AssemblyLoader.LoadAssembly(data.AssemblyName);
                 objectview.SelectedNode.ImageKey = "accept.png";
                 objectview.SelectedNode.SelectedImageKey = "accept.png";
                 objectview.SelectedNode.Nodes.Clear();
@@ -403,7 +413,7 @@ namespace Oxide.Patcher
                 string origfilename = Path.Combine(CurrentProject.TargetDirectory, Path.GetFileNameWithoutExtension(data.AssemblyName) + "_Original" + Path.GetExtension(data.AssemblyName));
                 if (!File.Exists(origfilename))
                 {
-                    CreateOriginal(realfilename, origfilename);
+                    AssemblyLoader.CreateOriginal(realfilename, origfilename);
                 }
 
                 // Populate
@@ -442,7 +452,7 @@ namespace Oxide.Patcher
                 if (hook.Flagged == false)
                 {
                     hook.Flagged = true;
-                    UpdateHook(hook, false);
+                    UpdateHook(hook);
                 }
             }
         }
@@ -455,7 +465,7 @@ namespace Oxide.Patcher
                 if (hook.Flagged)
                 {
                     hook.Flagged = false;
-                    UpdateHook(hook, false);
+                    UpdateHook(hook);
                 }
             }
         }
@@ -471,6 +481,7 @@ namespace Oxide.Patcher
                         hook.Flagged = false;
                     }
                 }
+
                 UpdateAllHooks();
             }
         }
@@ -481,11 +492,12 @@ namespace Oxide.Patcher
             {
                 foreach (Hook hook in CurrentProject.Manifests.SelectMany(m => m.Hooks))
                 {
-                    if (hook.Flagged == false)
+                    if (!hook.Flagged)
                     {
                         hook.Flagged = true;
                     }
                 }
+
                 UpdateAllHooks();
             }
         }
@@ -500,7 +512,7 @@ namespace Oxide.Patcher
                     if (!hook.Flagged)
                     {
                         hook.Flagged = true;
-                        UpdateHook(hook, false);
+                        UpdateHook(hook);
                     }
                 }
             }
@@ -516,7 +528,7 @@ namespace Oxide.Patcher
                     if (hook.Flagged)
                     {
                         hook.Flagged = false;
-                        UpdateHook(hook, false);
+                        UpdateHook(hook);
                     }
                 }
             }
@@ -581,7 +593,7 @@ namespace Oxide.Patcher
                             }
 
                             hook.HookCategory = e.Label;
-                            UpdateHook(hook, false);
+                            UpdateHook(hook);
                         }
                         objectview.BeginInvoke(new Action(() =>
                         {
@@ -635,7 +647,7 @@ namespace Oxide.Patcher
                 if (hook != null)
                 {
                     hook.HookCategory = null;
-                    UpdateHook(hook, false);
+                    UpdateHook(hook);
                 }
                 node.Parent.Nodes.Add(child);
             }
@@ -747,7 +759,7 @@ namespace Oxide.Patcher
             targetNode.Nodes.Add(dragNode);
 
             hook.HookCategory = targetNode.Text;
-            UpdateHook(hook, false);
+            UpdateHook(hook);
             Sort(targetNode.Nodes);
             objectview.SelectedNode = dragNode;
         }
@@ -760,6 +772,28 @@ namespace Oxide.Patcher
         private void objectview_DragLeave(object sender, EventArgs e)
         {
             DragDropHelper.ImageList_DragLeave(objectview.Handle);
+        }
+
+        private void ModifiersFlagAll(object sender, EventArgs args)
+        {
+            foreach (Modifier modifier in CurrentProject.Manifests.SelectMany(x => x.Modifiers))
+            {
+                modifier.Flagged = true;
+                UpdateModifier(modifier, true);
+            }
+
+            CurrentProject.Save(CurrentProjectFilename);
+        }
+
+        private void ModifiersUnflagAll(object sender, EventArgs args)
+        {
+            foreach (Modifier modifier in CurrentProject.Manifests.SelectMany(x => x.Modifiers))
+            {
+                modifier.Flagged = false;
+                UpdateModifier(modifier, true);
+            }
+
+            CurrentProject.Save(CurrentProjectFilename);
         }
 
         #endregion Object View Handlers
@@ -812,60 +846,6 @@ namespace Oxide.Patcher
         public void SetDocsButtonEnabled(bool enabled)
         {
             generateDocsButton.Enabled = enabled;
-        }
-
-        internal AssemblyDefinition LoadAssembly(string name)
-        {
-            if (assemblydict.TryGetValue(name, out AssemblyDefinition assdef))
-            {
-                return assdef;
-            }
-
-            string file = $"{Path.GetFileNameWithoutExtension(name)}_Original{Path.GetExtension(name)}";
-            string filename = Path.Combine(CurrentProject.TargetDirectory, file);
-            if (!File.Exists(filename))
-            {
-                string oldfilename = Path.Combine(CurrentProject.TargetDirectory, name);
-                if (!File.Exists(oldfilename))
-                {
-                    return null;
-                }
-
-                CreateOriginal(oldfilename, filename);
-            }
-            assdef = AssemblyDefinition.ReadAssembly(filename, new ReaderParameters { AssemblyResolver = resolver });
-            assemblydict.Add(name, assdef);
-            rassemblydict.Add(assdef, name);
-            return assdef;
-        }
-
-        private void CreateOriginal(string oldfile, string newfile)
-        {
-            AssemblyDefinition assembly = AssemblyDefinition.ReadAssembly(oldfile, new ReaderParameters { AssemblyResolver = resolver });
-            Deobfuscator deob = Deobfuscators.Find(assembly);
-            if (deob != null)
-            {
-                DialogResult result = MessageBox.Show(this,
-                    $"Assembly '{assembly.MainModule.Name}' appears to be obfuscated using '{deob.Name}', attempt to deobfuscate?", "Oxide Patcher", MessageBoxButtons.YesNo, MessageBoxIcon.Exclamation);
-                if (result == DialogResult.Yes)
-                {
-                    // Deobfuscate
-                    if (deob.Deobfuscate(assembly))
-                    {
-                        // Success
-                        if (File.Exists(newfile))
-                        {
-                            File.Delete(newfile);
-                        }
-
-                        assembly.Write(newfile);
-                        return;
-                    }
-
-                    MessageBox.Show(this, "Deobfuscation failed!", "Oxide Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                }
-            }
-            File.Copy(oldfile, newfile);
         }
 
         private bool IsFileOriginal(string filename)
@@ -964,7 +944,11 @@ namespace Oxide.Patcher
                         }
                     }
 
-                    TreeNode hooknode = new TreeNode(hook.Name);
+                    TreeNode hooknode = new TreeNode(hook.Name)
+                    {
+                        Name = hook.Name
+                    };
+
                     if (hook.Flagged)
                     {
                         hooknode.ImageKey = "script_error.png";
@@ -1097,7 +1081,7 @@ namespace Oxide.Patcher
                             data.Included = true;
                             data.AssemblyName = assemblyfile;
                             data.Loaded = true;
-                            data.Definition = LoadAssembly(assemblyfile);
+                            data.Definition = AssemblyLoader.LoadAssembly(assemblyfile);
 
                             // Create a node for it
                             TreeNode assembly = new TreeNode(assemblyname);
@@ -1390,142 +1374,6 @@ namespace Oxide.Patcher
             tabview.SelectedTab = tab;
         }
 
-        private void VerifyProject()
-        {
-            // Step 1: Check all included assemblies are intact
-            // Step 2: Check all hooks are intact
-            // Step 3: Check all modifiers are intact
-            int missingAssemblies = 0, missingMethods = 0, changedMethods = 0, changedFields = 0, changedModMethods = 0, changedProperties = 0, changedNewFields = 0;
-            foreach (Manifest manifest in CurrentProject.Manifests)
-            {
-                AssemblyDefinition assdef = LoadAssembly(manifest.AssemblyName);
-                if (assdef == null)
-                {
-                    missingAssemblies++;
-                    foreach (Hook hook in manifest.Hooks)
-                    {
-                        hook.Flagged = true;
-                    }
-                }
-                else
-                {
-                    foreach (Hook hook in manifest.Hooks)
-                    {
-                        MethodDefinition method = GetMethod(hook.AssemblyName, hook.TypeName, hook.Signature);
-                        if (method == null)
-                        {
-                            missingMethods++;
-                            hook.Flagged = true;
-                        }
-                        else
-                        {
-                            string hash = new ILWeaver(method.Body).Hash;
-                            if (hash != hook.MSILHash)
-                            {
-                                changedMethods++;
-                                hook.MSILHash = hash;
-                                hook.Flagged = true;
-                            }
-                        }
-                    }
-
-                    foreach (Modifier modifier in manifest.Modifiers)
-                    {
-                        switch (modifier.Type)
-                        {
-                            case ModifierType.Field:
-                                FieldDefinition fielddef = GetField(modifier.AssemblyName, modifier.TypeName, modifier.Name, modifier.Signature);
-                                if (fielddef == null)
-                                {
-                                    changedFields++;
-                                    modifier.Flagged = true;
-                                }
-                                break;
-
-                            case ModifierType.Method:
-                                MethodDefinition methoddef = GetMethod(modifier.AssemblyName, modifier.TypeName, modifier.Signature);
-                                if (methoddef == null)
-                                {
-                                    changedModMethods++;
-                                    modifier.Flagged = true;
-                                }
-                                break;
-
-                            case ModifierType.Property:
-                                PropertyDefinition propertydef = GetProperty(modifier.AssemblyName, modifier.TypeName, modifier.Name, modifier.Signature);
-                                if (propertydef == null)
-                                {
-                                    changedProperties++;
-                                    modifier.Flagged = true;
-                                }
-                                break;
-                        }
-                    }
-
-                    foreach (Field field in manifest.Fields)
-                    {
-                        if (field.IsValid())
-                        {
-                            continue;
-                        }
-
-                        changedNewFields++;
-                        field.Flagged = true;
-                    }
-                }
-            }
-
-            if (missingAssemblies <= 0 && missingMethods <= 0 && changedMethods <= 0 && changedFields <= 0 &&
-                changedModMethods <= 0 && changedProperties <= 0 && changedNewFields <= 0)
-            {
-                return;
-            }
-
-            CurrentProject.Save(CurrentProjectFilename);
-
-            if (missingAssemblies >= 1)
-            {
-                MessageBox.Show(this, $"{missingAssemblies} assembl{(missingAssemblies > 1 ? "ies" : "ly")} are missing from the target directory!",
-                                "Oxide Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-
-            if (missingMethods >= 1)
-            {
-                MessageBox.Show(this, $"{missingMethods} method{(missingMethods > 1 ? "s" : string.Empty)} referenced by hooks no longer exist!",
-                                "Oxide Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-
-            if (changedMethods >= 1)
-            {
-                MessageBox.Show(this, $"{changedMethods} method{(changedMethods > 1 ? "s" : string.Empty)} referenced by hooks have changed!",
-                                "Oxide Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-
-            if (changedFields >= 1)
-            {
-                MessageBox.Show(this, $"{changedFields} field{(changedFields > 1 ? "s" : string.Empty)} with altered modifiers have changed!",
-                                "Oxide Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-
-            if (changedModMethods >= 1)
-            {
-                MessageBox.Show(this, $"{changedModMethods} method{(changedModMethods > 1 ? "s" : string.Empty)} with altered modifiers have changed!",
-                                "Oxide Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-
-            if (changedProperties >= 1)
-            {
-                MessageBox.Show(this, $"{changedProperties} propert{(changedProperties > 1 ? "ies" : "y")} with altered modifiers have changed!",
-                                "Oxide Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-
-            if (changedNewFields >= 1)
-            {
-                MessageBox.Show(this, $"{changedNewFields} new field{(changedNewFields > 1 ? "s" : string.Empty)} were flagged!",
-                                "Oxide Patcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
         private bool CategoryExists(string label)
         {
             return objectview.Nodes["Hooks"].Nodes.Cast<TreeNode>().Any(node => node.Text == label);
@@ -1606,6 +1454,7 @@ namespace Oxide.Patcher
             // Open new project data
             CurrentProjectFilename = fileName;
             CurrentProject = Project.Load(fileName);
+            AssemblyLoader = new AssemblyLoader(CurrentProject, CurrentProjectFilename);
 
             if (CurrentProject == null)
             {
@@ -1648,10 +1497,8 @@ namespace Oxide.Patcher
                 }
             }
 
-            resolver = new PatcherAssemblyResolver(CurrentProject.TargetDirectory);
-
             // Verify
-            VerifyProject();
+            AssemblyLoader.VerifyProject();
 
             // Populate tree
             PopulateInitialTree();
@@ -1677,9 +1524,6 @@ namespace Oxide.Patcher
             // Set project to null
             CurrentProject = null;
             CurrentProjectFilename = null;
-
-            // Clear the assembly dictionary
-            assemblydict.Clear();
         }
 
         /// <summary>
@@ -1782,7 +1626,11 @@ namespace Oxide.Patcher
                 return;
             }
 
-            TreeNode hooknode = new TreeNode(hook.Name);
+            TreeNode hooknode = new TreeNode(hook.Name)
+            {
+                Name = hook.Name
+            };
+
             if (hook.Flagged)
             {
                 hooknode.ImageKey = "script_error.png";
@@ -1892,7 +1740,7 @@ namespace Oxide.Patcher
             {
                 cloneHooks[hook].BaseHook = null;
                 cloneHooks[hook].Flagged = true;
-                UpdateHook(cloneHooks[hook], false);
+                UpdateHook(cloneHooks[hook]);
             }
             CurrentProject.Save(CurrentProjectFilename);
 
@@ -2000,127 +1848,126 @@ namespace Oxide.Patcher
         /// </summary>
         /// <param name="hook"></param>
         /// <param name="batchUpdate"></param>
-        public void UpdateHook(Hook hook, bool batchUpdate)
+        public bool UpdateHook(Hook hook, bool batchUpdate = false, string oldName = null)
         {
-            Manifest manifest = CurrentProject.GetManifest(hook.AssemblyName);
-            Dictionary<Hook, Hook> cloneHooks = manifest.Hooks.Where(h => h.BaseHook != null).ToDictionary(h => h.BaseHook);
-
-            if (cloneHooks.ContainsKey(hook) && hook.Flagged)
+            //Flag child hooks (don't do this when updating all hooks)
+            if (!batchUpdate && hook.ChildHook != null && hook.Flagged)
             {
-                cloneHooks[hook].Flagged = true;
-                UpdateHook(cloneHooks[hook], false);
+                hook.ChildHook.Flagged = true;
+                UpdateHook(hook.ChildHook);
             }
 
-            if (hook.BaseHook != null)
+            Hook baseHook = hook.BaseHook;
+
+            if (baseHook != null && baseHook.Flagged && !hook.Flagged)
             {
-                if (hook.BaseHook.Flagged && !hook.Flagged)
+                DialogResult result = MessageBox.Show($"Can't unflag '{hook.Name}' because its base hook '{baseHook.Name}' is flagged. Do you want to unflag both of these hooks?",
+                                                      "Cannot unflag", MessageBoxButtons.YesNo, MessageBoxIcon.Error);
+
+                if (result != DialogResult.Yes)
                 {
                     hook.Flagged = true;
-                    MessageBox.Show($"Can't unflag {hook.Name} because its base hook {hook.BaseHook.Name} is flagged", "Cannot unflag", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    return;
+                    return false;
+                }
+
+                baseHook.Flagged = false;
+                if (!UpdateHook(baseHook))
+                {
+                    hook.Flagged = true;
+                    return false;
                 }
             }
 
-            foreach (TabPage tabpage in tabview.TabPages)
-            {
-                if (tabpage.Tag is HookViewControl && (tabpage.Tag as HookViewControl).Hook == hook)
-                {
-                    tabpage.Text = hook.Name;
-                    if (hook.Flagged)
-                    {
-                        (tabpage.Tag as HookViewControl).UnflagButton.Enabled = true;
-                        (tabpage.Tag as HookViewControl).FlagButton.Enabled = false;
-                    }
-                    else
-                    {
-                        (tabpage.Tag as HookViewControl).UnflagButton.Enabled = false;
-                        (tabpage.Tag as HookViewControl).FlagButton.Enabled = true;
-                    }
-                }
-            }
             if (!batchUpdate)
             {
                 CurrentProject.Save(CurrentProjectFilename);
             }
 
-            TreeNode hooks = null;
-            foreach (object node in objectview.Nodes)
+            //Update open hook tab
+            foreach (TabPage tabPage in tabview.TabPages)
             {
-                if ((node as TreeNode).Text == "Hooks")
+                if (!(tabPage.Tag is HookViewControl control) || control.Hook != hook)
                 {
-                    hooks = node as TreeNode;
-                    break;
+                    continue;
                 }
+
+                tabPage.Text = hook.Name;
+
+                control.UnflagButton.Enabled = hook.Flagged;
+                control.FlagButton.Enabled = !hook.Flagged;
+                break;
             }
 
+            TreeNode hooks = objectview.Nodes["Hooks"];
             if (hooks == null)
             {
-                return;
+                return false;
             }
 
-            foreach (object node in hooks.Nodes)
+            //Sort all nodes if hook does not have a category (node will be in root tree)
+            if (string.IsNullOrEmpty(hook.HookCategory))
             {
-                string tag = (node as TreeNode).Tag as string;
-                if (tag != null && tag == "Category")
+                TreeNode node = hooks.Nodes[oldName ?? hook.Name];
+
+                node.ImageKey = hook.Flagged ? "script_error.png" : "script_lightning.png";
+                node.SelectedImageKey = hook.Flagged ? "script_error.png" : "script_lightning.png";
+
+                if (node.Text != hook.Name)
                 {
-                    TreeNode category = node as TreeNode;
-                    bool flagged = false;
-                    foreach (object subnode in category.Nodes)
-                    {
-                        if ((subnode as TreeNode).Tag == hook)
-                        {
-                            TreeNode treenode = subnode as TreeNode;
-
-                            treenode.Text = hook.Name;
-                            if (hook.Flagged)
-                            {
-                                treenode.ImageKey = "script_error.png";
-                                treenode.SelectedImageKey = "script_error.png";
-                            }
-                            else
-                            {
-                                treenode.ImageKey = "script_lightning.png";
-                                treenode.SelectedImageKey = "script_lightning.png";
-                            }
-                        }
-                        if (((subnode as TreeNode).Tag as Hook).Flagged)
-                        {
-                            flagged = true;
-                        }
-                    }
-
-                    if (flagged)
-                    {
-                        category.ImageKey = "folder_flagged.png";
-                        category.SelectedImageKey = "folder_flagged.png";
-                    }
-                    else
-                    {
-                        category.ImageKey = "folder.png";
-                        category.SelectedImageKey = "folder.png";
-                    }
-
-                    Sort(category.Nodes);
-                }
-                else if ((node as TreeNode).Tag == hook)
-                {
-                    TreeNode treenode = node as TreeNode;
-
-                    treenode.Text = hook.Name;
-                    if (hook.Flagged)
-                    {
-                        treenode.ImageKey = "script_error.png";
-                        treenode.SelectedImageKey = "script_error.png";
-                    }
-                    else
-                    {
-                        treenode.ImageKey = "script_lightning.png";
-                        treenode.SelectedImageKey = "script_lightning.png";
-                    }
+                    node.Text = hook.Name;
+                    node.Name = hook.Name;
                     Sort(hooks.Nodes);
-                    break;
                 }
+
+                return true;
             }
+
+            TreeNode categoryNode = hooks.Nodes[hook.HookCategory];
+            if (categoryNode == null)
+            {
+                return false;
+            }
+
+            //Update hook category folder
+            bool shouldSort = false;
+
+            TreeNode hookNode = categoryNode.Nodes[oldName ?? hook.Name];
+            if (hookNode != null)
+            {
+                if (hookNode.Text != hook.Name)
+                {
+                    hookNode.Text = hook.Name;
+                    hookNode.Name = hook.Name;
+                    shouldSort = true;
+                }
+
+                hookNode.ImageKey = hook.Flagged ? "script_error.png" : "script_lightning.png";
+                hookNode.SelectedImageKey = hook.Flagged ? "script_error.png" : "script_lightning.png";
+            }
+
+            bool anyFlagged = false;
+
+            //Change icon if any hooks are flagged
+            foreach (TreeNode subNode in categoryNode.Nodes)
+            {
+                if (!(subNode.Tag is Hook tagHook) || !tagHook.Flagged)
+                {
+                    continue;
+                }
+
+                anyFlagged = true;
+                break;
+            }
+
+            categoryNode.ImageKey = anyFlagged ? "folder_flagged.png" : "folder.png";
+            categoryNode.SelectedImageKey = anyFlagged ? "folder_flagged.png" : "folder.png";
+
+            if (shouldSort)
+            {
+                Sort(categoryNode.Nodes);
+            }
+
+            return true;
         }
 
         /// <summary>
@@ -2130,38 +1977,24 @@ namespace Oxide.Patcher
         /// <param name="batchUpdate"></param>
         public void UpdateModifier(Modifier modifier, bool batchUpdate)
         {
-            foreach (TabPage tabpage in tabview.TabPages)
+            foreach (TabPage tabPage in tabview.TabPages)
             {
-                if (tabpage.Tag is ModifierViewControl && (tabpage.Tag as ModifierViewControl).Modifier == modifier)
+                if (!(tabPage.Tag is ModifierViewControl control) || control.Modifier != modifier)
                 {
-                    tabpage.Text = modifier.Name;
-                    if (modifier.Flagged)
-                    {
-                        (tabpage.Tag as ModifierViewControl).UnflagButton.Enabled = true;
-                        (tabpage.Tag as ModifierViewControl).FlagButton.Enabled = false;
-                    }
-                    else
-                    {
-                        (tabpage.Tag as ModifierViewControl).UnflagButton.Enabled = false;
-                        (tabpage.Tag as ModifierViewControl).FlagButton.Enabled = true;
-                    }
+                    continue;
                 }
+
+                tabPage.Text = modifier.Name;
+                control.UnflagButton.Enabled = modifier.Flagged;
+                control.FlagButton.Enabled = !modifier.Flagged;
             }
+
             if (!batchUpdate)
             {
                 CurrentProject.Save(CurrentProjectFilename);
             }
 
-            TreeNode modifiers = null;
-            foreach (object node in objectview.Nodes)
-            {
-                if ((node as TreeNode).Text == "Modifiers")
-                {
-                    modifiers = node as TreeNode;
-                    break;
-                }
-            }
-
+            TreeNode modifiers = objectview.Nodes["Modifiers"];
             if (modifiers == null)
             {
                 return;
@@ -2169,24 +2002,21 @@ namespace Oxide.Patcher
 
             foreach (object node in modifiers.Nodes)
             {
-                if ((node as TreeNode).Tag == modifier)
+                if (!(node is TreeNode treeNode) || treeNode.Tag != modifier)
                 {
-                    TreeNode treenode = node as TreeNode;
-
-                    treenode.Text = modifier.Name;
-                    if (modifier.Flagged)
-                    {
-                        treenode.ImageKey = "script_error.png";
-                        treenode.SelectedImageKey = "script_error.png";
-                    }
-                    else
-                    {
-                        treenode.ImageKey = "script_lightning.png";
-                        treenode.SelectedImageKey = "script_lightning.png";
-                    }
-                    Sort(modifiers.Nodes);
-                    break;
+                    continue;
                 }
+
+                treeNode.ImageKey = modifier.Flagged ? "script_error.png" : "script_lightning.png";
+                treeNode.SelectedImageKey = modifier.Flagged ? "script_error.png" : "script_lightning.png";
+
+                if (treeNode.Text != modifier.Name)
+                {
+                    treeNode.Text = modifier.Name;
+                    Sort(modifiers.Nodes);
+                }
+
+                break;
             }
         }
 
@@ -2266,152 +2096,12 @@ namespace Oxide.Patcher
                 {
                     UpdateHook(hook, true);
                 }
+
                 CurrentProject.Save(CurrentProjectFilename);
             }
         }
 
-        /// <summary>
-        /// Gets the method associated with the specified signature
-        /// </summary>
-        /// <param name="assemblyname"></param>
-        /// <param name="typename"></param>
-        /// <param name="signature"></param>
-        public MethodDefinition GetMethod(string assemblyname, string typename, MethodSignature signature)
-        {
-            if (!assemblydict.TryGetValue(assemblyname, out AssemblyDefinition assdef))
-            {
-                return null;
-            }
-
-            try
-            {
-                TypeDefinition type = assdef.Modules.SelectMany(m => m.GetTypes()).Single(t => t.FullName == typename);
-
-                return type.Methods.Single(m => Utility.GetMethodSignature(m).Equals(signature));
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Gets the method associated with the specified signature
-        /// </summary>
-        /// <param name="assemblyname"></param>
-        /// <param name="typename"></param>
-        /// <param name="signature"></param>
-        public MethodDefinition GetMethod(string assemblyname, string typename, ModifierSignature signature)
-        {
-            if (!assemblydict.TryGetValue(assemblyname, out AssemblyDefinition assdef))
-            {
-                return null;
-            }
-
-            try
-            {
-                TypeDefinition type = assdef.Modules.SelectMany(m => m.GetTypes()).Single(t => t.FullName == typename);
-
-                return type.Methods.Single(m => Utility.GetModifierSignature(m).Equals(signature));
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Gets the field associated with the specified signature
-        /// </summary>
-        /// <param name="assemblyname"></param>
-        /// <param name="typename"></param>
-        /// <param name="name"></param>
-        /// <param name="signature"></param>
-        public FieldDefinition GetField(string assemblyname, string typename, string name, ModifierSignature signature)
-        {
-            if (!assemblydict.TryGetValue(assemblyname, out AssemblyDefinition assdef))
-            {
-                return null;
-            }
-
-            try
-            {
-                TypeDefinition type = assdef.Modules.SelectMany(m => m.GetTypes()).Single(t => t.FullName == typename);
-
-                return type.Fields.Single(m => Utility.GetModifierSignature(m).Equals(signature));
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Gets the property associated with the specified signature
-        /// </summary>
-        /// <param name="assemblyname"></param>
-        /// <param name="typename"></param>
-        /// <param name="name"></param>
-        /// <param name="signature"></param>
-        public PropertyDefinition GetProperty(string assemblyname, string typename, string name, ModifierSignature signature)
-        {
-            if (!assemblydict.TryGetValue(assemblyname, out AssemblyDefinition assdef))
-            {
-                return null;
-            }
-
-            try
-            {
-                TypeDefinition type = assdef.Modules.SelectMany(m => m.GetTypes()).Single(t => t.FullName == typename);
-
-                return type.Properties.Single(m => Utility.GetModifierSignature(m).Equals(signature));
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Gets the type associated with the specified signature
-        /// </summary>
-        /// <param name="assemblyname"></param>
-        /// <param name="typename"></param>
-        public TypeDefinition GetType(string assemblyname, string typename)
-        {
-            if (!assemblydict.TryGetValue(assemblyname, out AssemblyDefinition assdef))
-            {
-                return null;
-            }
-
-            try
-            {
-                return assdef.Modules.SelectMany(m => m.GetTypes()).Single(t => t.FullName == typename);
-            }
-            catch (Exception)
-            {
-                return null;
-            }
-        }
-
         #endregion Code Interface
-    }
-
-    public static class Extensions
-    {
-        /// <summary>
-        /// Get the string slice between the two indexes.
-        /// Inclusive for start index, exclusive for end index.
-        /// </summary>
-        public static string Slice(this string source, int start, int end)
-        {
-            if (end < 0) // Keep this for negative end support
-            {
-                end = source.Length + end;
-            }
-            int len = end - start; // Calculate length
-            return source.Substring(start, len); // Return Substring of length
-        }
     }
 
     public class DragDropHelper
